@@ -15,16 +15,21 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-// MongoDBStore TODO
+// MongoDBStore stores sessions using mongoDB as backend.
 type MongoDBStore struct {
 	coll    *mongo.Collection
 	codecs  []securecookie.Codec
 	options sessions.Options
 }
 
-// MongoDBStoreConfig TODO
+// MongoDBStoreConfig is a configuration options for MongoDBStore
 type MongoDBStoreConfig struct {
-	IndexTTL       bool
+
+	// whether to create TTL index(https://docs.mongodb.com/manual/core/index-ttl/)
+	// for the session document
+	IndexTTL bool
+
+	// gorilla-sessions options
 	SessionOptions sessions.Options
 }
 
@@ -43,7 +48,7 @@ var defaultConfig = MongoDBStoreConfig{
 	},
 }
 
-// NewMongoDBStoreWithConfig TODO
+// NewMongoDBStoreWithConfig returns a new NewMongoDBStore with a custom MongoDBStoreConfig
 func NewMongoDBStoreWithConfig(coll *mongo.Collection, cfg MongoDBStoreConfig, keyPairs ...[]byte) (*MongoDBStore, error) {
 	codecs := securecookie.CodecsFromPairs(keyPairs...)
 	for _, codec := range codecs {
@@ -58,6 +63,120 @@ func NewMongoDBStoreWithConfig(coll *mongo.Collection, cfg MongoDBStoreConfig, k
 	}
 
 	return store, store.ensureIndexTTL()
+}
+
+// NewMongoDBStore returns a new NewMongoDBStore with default config
+//
+// defaultConfig := MongoDBStoreConfig{
+// 	IndexTTL: true,
+// 	SessionOptions: sessions.Options{
+// 		Path:     "/",
+// 		MaxAge:   3600 * 24 * 30,
+// 		HttpOnly: true,
+// 	},
+// }
+func NewMongoDBStore(col *mongo.Collection, keyPairs ...[]byte) (*MongoDBStore, error) {
+	return NewMongoDBStoreWithConfig(col, defaultConfig, keyPairs...)
+}
+
+// Get returns a session for the given name after adding it to the registry.
+//
+// It returns a new session if the sessions doesn't exist. Access IsNew on
+// the session to check if it is an existing session or a new one.
+//
+// It returns a new session and an error if the session exists but could
+// not be decoded.
+func (mstore *MongoDBStore) Get(r *http.Request, name string) (*sessions.Session, error) {
+	return sessions.GetRegistry(r).Get(mstore, name)
+}
+
+// New returns a session for the given name without adding it to the registry.
+//
+// The difference between New() and Get() is that calling New() twice will
+// decode the session data twice, while Get() registers and reuses the same
+// decoded session after the first call.
+func (mstore *MongoDBStore) New(r *http.Request, name string) (*sessions.Session, error) {
+	session := sessions.NewSession(mstore, name)
+	session.Options = &mstore.options
+	session.IsNew = true
+
+	cookie, err := r.Cookie(name)
+	if err != nil {
+		return session, nil
+	}
+	err = securecookie.DecodeMulti(name, cookie.Value, &session.ID, mstore.codecs...)
+	if err != nil {
+		return session, err
+	}
+
+	found, err := mstore.load(session)
+	if err != nil {
+		return session, err
+	}
+	session.IsNew = !found
+
+	return session, nil
+}
+
+// Save adds a single session to the response and persist session in mongoDB collection
+//
+// If the Options.MaxAge of the session is <= 0 then the session file will be
+// deleted from the store path. With this process it enforces the properly
+// session cookie handling so no need to trust in the cookie management in the
+// web browser.
+func (mstore *MongoDBStore) Save(r *http.Request, w http.ResponseWriter, session *sessions.Session) error {
+	ctx := context.Background()
+
+	var ID primitive.ObjectID
+	if session.ID == "" {
+		ID = primitive.NewObjectID()
+		session.ID = ID.Hex()
+	} else {
+		newID, err := primitive.ObjectIDFromHex(session.ID)
+		if err != nil {
+			return err
+		}
+		ID = newID
+	}
+
+	if session.Options.MaxAge < 0 {
+		_, err := mstore.coll.DeleteOne(ctx, bson.M{"_id": ID})
+		if err != nil {
+			return err
+		}
+		http.SetCookie(w, sessions.NewCookie(session.Name(), "", session.Options))
+
+		return nil
+	}
+
+	encoded, err := securecookie.EncodeMulti(session.Name(), session.Values, mstore.codecs...)
+	if err != nil {
+		return err
+	}
+	sessDoc := &sessionDoc{
+		ID:       ID,
+		Modified: time.Now(),
+		Data:     encoded,
+	}
+	if val, ok := session.Values["modified"]; ok {
+		modified, ok := val.(time.Time)
+		if !ok {
+			return errors.New("mongodbstore: invalid modified value")
+		}
+		sessDoc.Modified = modified
+	}
+	_, err = mstore.coll.UpdateOne(ctx, bson.M{"_id": ID}, bson.M{"$set": sessDoc}, options.Update().SetUpsert(true))
+	if err != nil {
+		return err
+	}
+	encodedID, err := securecookie.EncodeMulti(session.Name(), session.ID, mstore.codecs...)
+	if err != nil {
+		return err
+	}
+
+	http.SetCookie(w, sessions.NewCookie(session.Name(), encodedID, session.Options))
+
+	return nil
 }
 
 func (mstore *MongoDBStore) ensureIndexTTL() error {
@@ -104,39 +223,6 @@ func (mstore *MongoDBStore) ensureIndexTTL() error {
 	return nil
 }
 
-// NewMongoDBStore TODO
-func NewMongoDBStore(col *mongo.Collection, keyPairs ...[]byte) (*MongoDBStore, error) {
-	return NewMongoDBStoreWithConfig(col, defaultConfig, keyPairs...)
-}
-
-// Get TODO
-func (mstore *MongoDBStore) Get(r *http.Request, name string) (*sessions.Session, error) {
-	return sessions.GetRegistry(r).Get(mstore, name)
-}
-
-// New TODO
-func (mstore *MongoDBStore) New(r *http.Request, name string) (*sessions.Session, error) {
-	session := sessions.NewSession(mstore, name)
-	session.Options = &mstore.options
-	session.IsNew = true
-
-	cookie, err := r.Cookie(name)
-	if err != nil {
-		return session, nil
-	}
-	err = securecookie.DecodeMulti(name, cookie.Value, &session.ID, mstore.codecs...)
-	if err != nil {
-		return session, err
-	}
-
-	found, err := mstore.load(session)
-	if err != nil {
-		return session, err
-	}
-	session.IsNew = found
-
-	return session, nil
-}
 func (mstore *MongoDBStore) load(sess *sessions.Session) (found bool, err error) {
 	ID, err := primitive.ObjectIDFromHex(sess.ID)
 	if err != nil {
@@ -154,55 +240,4 @@ func (mstore *MongoDBStore) load(sess *sessions.Session) (found bool, err error)
 	}
 
 	return true, err
-}
-
-// Save TODO
-func (mstore *MongoDBStore) Save(r *http.Request, w http.ResponseWriter, session *sessions.Session) error {
-	ctx := context.Background()
-
-	var ID primitive.ObjectID
-	if session.ID == "" {
-		ID = primitive.NewObjectID()
-		session.ID = ID.Hex()
-	} else {
-		newID, err := primitive.ObjectIDFromHex(session.ID)
-		if err != nil {
-			return err
-		}
-		ID = newID
-	}
-
-	if session.Options.MaxAge < 0 {
-		_, err := mstore.coll.DeleteOne(ctx, bson.M{"_id": ID})
-		if err != nil {
-			return err
-		}
-		http.SetCookie(w, sessions.NewCookie(session.Name(), "", session.Options))
-
-		return nil
-	}
-
-	encoded, err := securecookie.EncodeMulti(session.Name(), session.ID, mstore.codecs...)
-	if err != nil {
-		return err
-	}
-	sessDoc := &sessionDoc{
-		ID:       ID,
-		Modified: time.Now(),
-		Data:     encoded,
-	}
-	if val, ok := session.Values["modified"]; ok {
-		modified, ok := val.(time.Time)
-		if !ok {
-			return errors.New("mongodbstore: invalid modified value")
-		}
-		sessDoc.Modified = modified
-	}
-	_, err = mstore.coll.UpdateOne(ctx, bson.M{"_id": ID}, sessDoc, options.Update().SetUpsert(true))
-	if err != nil {
-		return err
-	}
-	http.SetCookie(w, sessions.NewCookie(session.Name(), encoded, session.Options))
-
-	return nil
 }
