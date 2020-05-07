@@ -126,12 +126,12 @@ func (mstore *MongoDBStore) New(r *http.Request, name string) (*sessions.Session
 	}
 	err = securecookie.DecodeMulti(name, cookie.Value, &session.ID, mstore.codecs...)
 	if err != nil {
-		return nil, err
+		return session, err
 	}
 
 	found, err := mstore.load(session)
 	if err != nil {
-		return nil, err
+		return session, err
 	}
 	session.IsNew = found
 
