@@ -97,7 +97,8 @@ func (mstore *MongoDBStore) Get(r *http.Request, name string) (*sessions.Session
 // decoded session after the first call.
 func (mstore *MongoDBStore) New(r *http.Request, name string) (*sessions.Session, error) {
 	session := sessions.NewSession(mstore, name)
-	session.Options = &mstore.options
+	options := mstore.options
+	session.Options = &options
 	session.IsNew = true
 
 	cookie, err := r.Cookie(name)
